@@ -1,0 +1,2049 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+Analysis for the research project: 
+This contains: 
+
+- The downstream analysis of all the datasets(filtering of patients, pre-processing, differential expression, pathway enrichment) (starts at line 89)
+- The patient demographic information(starts at line 1472) 
+- The data manipulation of the differential expression analysis results (starts at line 1647)
+- The calculation of mean drug sensitivity scores of specified features (starts at line 1801).  
+
+load all required packages:
+```{r}
+# Install necessary packages for the project 
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+install.packages(c("readxl", "dplyr", "limma", "ggplot2"))
+BiocManager::install(c("DESeq2", "clusterProfiler", "org.Hs.eg.db", "limma", "DOSE"))
+BiocManager::install("preprocessCore")
+
+
+install.packages("ggrepel")
+install.packages("xfun")
+
+
+#libraries
+library(readxl)
+library(dplyr)
+library(limma)
+library(DESeq2)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(limma)
+library(DOSE)
+library(ggplot2)
+library(ggrepel)
+library(preprocessCore)
+
+install.packages("knitr")
+install.packages("rmarkdown")
+
+library(rmarkdown)
+library(knitr)
+
+```
+
+
+```{r}
+
+# Install gprofiler2  - for pathway enrichemnt analysis 
+if (!requireNamespace("gprofiler2", quietly = TRUE)) {
+  install.packages("gprofiler2")
+}
+
+library(gprofiler2)
+
+```
+
+
+```{r}
+ 
+#datasets used 
+prot_quant_data <- read.csv("prot_quant_poorrisk_aml.csv")
+rna_data <- read.csv("RNAseq both BCI and FINN.csv")
+ksea_data <- read.csv("KSEA poor risk AML dist all.csv")
+phosphoprotein_data <- read.csv("phosphoproteins_sum_ppsites_poor_risk_aml.csv")
+ppindex_data <- read.csv("ppindex_poorrisk_aml.csv")
+Table_of_sDSS <- read_excel("Table_of_sDSS.xlsx")
+
+#in data frames
+phosphoprotein_data <- data.frame(phosphoprotein_data) # 88
+ppindex_data <- data.frame(ppindex_data) # 85
+prot_quant_data <- data.frame(prot_quant_data) # 92
+rna_data <- data.frame(rna_data) # 77
+ksea_data <- data.frame(ksea_data) # 85
+
+
+#patient info
+patients_list <- read_excel("patient_list.xlsx", sheet = "Sheet1")
+patients_list <- data.frame(patients_list)
+pt_info <- read_excel("Poor risk AML clinical and genomic data.xltx")
+
+```
+
+
+Clarify patients: 
+```{r}
+
+
+# Classify patients into the top 20 of the two extremes, top 20 with shortest survival (less than 0.436 years) and top 20 of the longest survival (higher than 1.854 years)
+
+short_survivals <- patients_list %>%
+  filter(`SURVIVAL..YRS.` < 0.436) %>%
+  arrange(`SURVIVAL..YRS.`) %>%
+  head(20)
+
+long_survivals <- patients_list %>%
+  filter(`SURVIVAL..YRS.` > 1.854) %>%
+  arrange(desc(`SURVIVAL..YRS.`)) %>%
+  head(20)
+
+# Extract the sample names
+short_samples <- short_survivals$Sample_Name
+long_samples <- long_survivals$Sample_Name
+
+```
+
+
+PHOSPHOPROTEINS
+
+```{r}
+
+# Filter the phosphoprotein data
+phosphoproteins_filtered <- phosphoprotein_data %>%
+  dplyr::select(phosphoprotein, n.phosphopeptides, sites, all_of(short_samples), all_of(long_samples))
+
+dim(phosphoproteins_filtered)
+
+```
+
+Pre-processing steps:
+
+```{r}
+# Boxplot before preprocessing
+boxplot(phosphoproteins_filtered[, -c(1:3)], las = 3, main = "Phosphoprotein Data Distribution Before Preprocessing", cex.main = 2)  # to increase title text size
+
+#filtering low counts 
+keep_phospho <- rowSums(phosphoproteins_filtered[, -c(1:3)] >= 10) >= 3
+phosphoproteins_filtered <- phosphoproteins_filtered[keep_phospho,]
+
+# Log2 transformation
+log2_transformed <- phosphoproteins_filtered
+log2_transformed[, -c(1:3)] <- log2(phosphoproteins_filtered[, -c(1:3)] + 1)
+
+# Quantile normalization
+quantile_normalized <- log2_transformed
+quantile_normalized[, -c(1:3)] <- normalize.quantiles(as.matrix(log2_transformed[, -c(1:3)]))
+
+# Scaling (centering and scaling)
+scaled <- quantile_normalized
+scaled[, -c(1:3)] <- scale(quantile_normalized[, -c(1:3)], center = TRUE, scale = TRUE)
+
+# Create the final preprocessed dataset
+phospho_final <- scaled
+
+# Boxplot after preprocessing
+boxplot(phospho_final[, -c(1:3)], las = 3, main = "Phosphoprotein Data Distribution After Preprocessing (Log2, Quantile Normalization, Scaling)", cex.main = 2) 
+
+
+```
+
+
+Differential expression analysis using limma: 
+use compare.by.limma function - the same used in all: 
+```{r}
+
+compare.by.limma <- function(df.to.compare, control.samples, test.samples){
+  # Load library
+  library(limma)
+  
+  # Define the columns for control and test samples
+  control.samples <- intersect(control.samples, colnames(df.to.compare))
+  test.samples <- intersect(test.samples, colnames(df.to.compare))
+  
+  # Subset the dataframe to include only the control and test samples
+  df.s <- df.to.compare[, c(control.samples, test.samples)]
+  
+  # Create outcome labels for the samples
+  df.s1 <- data.frame(outcome = rep("control", length(control.samples)))
+  df.s2 <- data.frame(outcome = rep("test", length(test.samples)))
+  df.ss <- rbind(df.s1, df.s2)
+  
+  # Create the design matrix for limma
+  des <- factor(ifelse(df.ss$outcome == "test", "1", "2"))
+  facna <- addNA(des)
+  design <- model.matrix(~ 0 + factor(c(facna)))
+  colnames(design) <- c("control", "test")
+  
+  # Define the contrast matrix
+  contrast.matrix <- makeContrasts(test - control, levels = design)
+  
+  # Fit the linear model
+  fit <- lmFit(df.s, design)
+  fit2 <- contrasts.fit(fit, contrast.matrix)
+  fit2 <- eBayes(fit2)
+  
+  # Extract p-values and coefficients
+  pvals <- data.frame(fit2$p.value)
+  fvals <- data.frame(fit2$coefficients)
+  
+  # Create the result dataframe with dynamic column names
+  df.xx <- data.frame(protein = df.to.compare[,1],
+                      difference_test_vs_control = fvals,
+                      pvalues = pvals)
+  colnames(df.xx) <- c( "X", "difference.long.vs.short", "pvalues") #the first column is named X, because of the different datasets and different names, needed a common name for analysis
+  
+  # Adjust p-values - FDR
+  df.xx$FDR <- p.adjust(df.xx$pvalues, method = "fdr")
+  
+  return(df.xx)
+}
+
+#note: the positive:most expressed in the short survival 
+```
+
+
+
+```{r}
+
+# Perform differential expression analysis
+df.limma.phospho <- compare.by.limma(phospho_final, long_samples, short_samples)
+
+
+# Define the p-value threshold for significance
+p_value_threshold <- 0.05
+
+# Filter significant results based on the p-value
+significant_phospho_results <- df.limma.phospho[df.limma.phospho$pvalues < p_value_threshold, ]
+
+# View all significant results
+print(significant_phospho_results)
+
+
+# Order the significant results by absolute differential expression / most expressed but also p-value <0.05 
+significant_ph_res <- significant_phospho_results[order(abs(significant_phospho_results$difference.long.vs.short), decreasing = TRUE), ]
+
+# Filter the top 10 most significant hits
+top_significant_ph <- head(significant_ph_res, 10) 
+
+# View the top 10
+print(top_significant_ph)
+
+
+
+```
+
+
+
+```{r}
+#volcano plot 
+
+# Define p-value / threshold of significance 
+pval_threshold <- 0.05
+
+#volcano plot
+ggplot(df.limma.phospho, aes(x = difference.long.vs.short, y = -log10(pvalues))) +
+    geom_point(aes(color = pvalues < pval_threshold)) +
+    theme_minimal() +
+    labs(title = "Volcano Plot for Phosphoprotein Data", 
+         x = "Log2 Fold Change", 
+         y = "-log10(p-value)") +
+    geom_text_repel(data = top_significant_ph, #add the top 10 most significant features 
+                    aes(label = X),
+                    size = 3, 
+                    max.overlaps = Inf) +  # Use Inf to avoid filtering out top 5
+    scale_color_manual(values = c("red", "blue"), name = "pvalues < 0.05") +
+    theme(legend.position = "right")
+
+```
+
+
+
+Pathway enrichment analysis:
+
+GO Enrichment 
+
+
+```{r}
+# Load necessary libraries
+library(clusterProfiler)
+library(org.Hs.eg.db) 
+
+
+# Extract significant phosphoproteins
+significant_ph <- significant_phospho_results$X
+
+# Convert to Entrez IDs
+ph_entrez_ids <- bitr(significant_ph, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+#6.67% of input gene IDs are fail to map...
+
+
+# Perform GO enrichment analysis
+
+#biological processes 
+go_ph_enrichment <- enrichGO(gene = ph_entrez_ids$ENTREZID, 
+                          OrgDb = org.Hs.eg.db, 
+                          ont = "BP", # "BP" for Biological Processes
+                          pAdjustMethod = "none", # Ensures that unadjusted p-values are used
+                          pvalueCutoff = 0.01, #stingest cuttoff value 
+                          qvalueCutoff = 0.2, 
+                          readable = TRUE)
+
+
+
+# other categories (MF, CC)
+go_enrichment_ph_MF <- enrichGO(gene = ph_entrez_ids$ENTREZID, 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "MF", 
+                             pAdjustMethod = "none", #"MF" for Molecular Functions,
+                             pvalueCutoff = 0.01, 
+                             qvalueCutoff = 0.2, 
+                             readable = TRUE)
+
+go_enrichment_ph_CC <- enrichGO(gene = ph_entrez_ids$ENTREZID, 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "CC", #"CC" for Cellular Components
+                             pAdjustMethod = "none", 
+                             pvalueCutoff = 0.01, 
+                             qvalueCutoff = 0.2, 
+                             readable = TRUE)
+
+
+
+```
+
+
+```{r}
+# Visualize for GO biological processes pathways 
+barplot(go_ph_enrichment, showCategory = 10, title = "GO Biological Processes Enrichment of Phosphoprotein data")
+dotplot(go_ph_enrichment, showCategory = 10, title = "GO Biological Processes Enrichment of Phosphoprotein data")
+
+
+# Use heatplot 
+heatplot(go_ph_enrichment, showCategory = 10)
+```
+
+```{r}
+#network plot
+cnetplot(go_ph_enrichment, showCategory = 10, title = "Gene-Concept Network for Biological Processes of Phosphoprotein data", 
+         max.overlaps = 100, node_label_size = 3, label_fontsize = 8) +
+  theme(axis.text.x = element_text(size = 10), 
+        axis.text.y = element_text(size = 10), 
+        plot.title = element_text(size = 14, face = "bold"))
+
+#decided on the number 7 for the categories, as more overwhelms the plot and data points were unlabeled 
+```
+
+
+```{r}
+# Visualize the other categories: MF, CC
+
+#molecular functions 
+dotplot(go_enrichment_ph_MF, showCategory = 10, title = "GO Molecular Functions Enrichment of Phosphoprotein data")
+
+#cellular componentns
+dotplot(go_enrichment_ph_CC, showCategory = 10, title = "GO Cellular Components Enrichment of Phosphoprotein data")
+
+```
+
+
+For specifically bad-responders/ targets associated with short survival:
+
+
+```{r}
+#subset the data, keep only upregulated features in short survival group 
+subset_ph <- subset(significant_phospho_results, difference.long.vs.short > 0)
+clean_subset_ph <- subset_ph$X
+
+# Convert these kinase names to Entrez IDs
+en_ids_ph <- bitr(clean_subset_ph, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+
+#GO enrichment 
+go_ph_p_enrichment <- enrichGO(gene = en_ids_ph$ENTREZID, 
+                          OrgDb = org.Hs.eg.db, 
+                          ont = "BP", # "BP" for Biological Processes
+                          pAdjustMethod = "BH", 
+                          pvalueCutoff = 0.05, 
+                          qvalueCutoff = 0.2, 
+                          readable = TRUE)
+
+
+#Plots
+barplot(go_ph_p_enrichment, showCategory = 10, title = "GO Biological Processes enriched in short survival group")
+dotplot(go_ph_p_enrichment, showCategory = 10, title = "GO Biological Processes enriched in short survival group")
+heatplot(go_ph_p_enrichment, showCategory = 10)
+
+
+#network plot 
+cnetplot(go_ph_p_enrichment, showCategory = 4, title = "Gene-Concept Network for Biological Processes enriched in short survival group", 
+         max.overlaps = 100, node_label_size = 3, label_fontsize = 8) +
+  theme(axis.text.x = element_text(size = 10), 
+        axis.text.y = element_text(size = 10), 
+        plot.title = element_text(size = 14, face = "bold"))
+
+#decided on 4 to not overwhelm the network plot 
+```
+
+
+
+Using gprofiler2/ for all significant differentially expresssed features: 
+
+
+```{r}
+
+# Run gProfiler enrichment analysis
+gostres_ph <- gost(query = ph_entrez_ids$ENTREZID, 
+                organism = "hsapiens", 
+                sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC", "WP"), 
+                significant = TRUE, 
+                correction_method = "fdr",  
+                user_threshold = 0.05)
+
+# View the results
+head(gostres_ph$result)
+
+# Plot the results
+gostplot(gostres_ph, capped = TRUE, interactive = FALSE)
+
+```
+
+
+
+```{r}
+#Enhance function to plot results for a specific category (GO, KEGG, REACTOME, WIKIPATHWAYS) + add colors
+plot_results <- function(results, category, title) {
+  filtered_results <- results %>% 
+    filter(source == category) %>% 
+    arrange(p_value) %>% 
+    head(10)  # Top 10 results
+  
+  ggplot(filtered_results, aes(x = reorder(term_name, -p_value), y = -log10(p_value), fill = -log10(p_value))) +
+    geom_col() +
+    coord_flip() +
+    scale_fill_gradient(low = "lightblue", high = "darkblue") +  # Gradient color fill
+    labs(title = title, x = "Pathway", y = "-log10(p-value)") +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"), 
+      axis.text.x = element_text(size = 12), 
+      axis.text.y = element_text(size = 12),
+      legend.position = "none"
+    )
+}
+
+# Plot for each caterogy 
+bp_plot_ph <- plot_results(gostres_ph$result, "GO:BP", "Top Biological Processes of Phosphoprotein data")
+mf_plot_ph <- plot_results(gostres_ph$result, "GO:MF", "Top Molecular Functions of Phosphoprotein data")
+cc_plot_ph <- plot_results(gostres_ph$result, "GO:CC", "Top Cellular Components of Phosphoprotein data")
+reac_plot_ph <- plot_results(gostres_ph$result, "REAC", "Top Reactome Pathways of Phosphoprotein data")
+kegg_plot_ph <- plot_results(gostres_ph$result, "KEGG", "Top KEGG Pathways of Phosphoprotein data")
+wp_plot_ph <- plot_results(gostres_ph$result, "WP", "Top WikiPathways of Phosphoprotein data")
+
+# Print the plots
+print(bp_plot_ph)
+print(mf_plot_ph)
+print(cc_plot_ph)
+print(reac_plot_ph) #No Reactome pathways identified
+print(kegg_plot_ph) #No KEGG pathays identified
+print(wp_plot_ph) #NO Wiki Pathways identified
+
+```
+
+
+PP_INDEX data:
+
+
+```{r}
+# Filter ppindex data
+ppindex_filtered <- ppindex_data %>%
+  dplyr::select(X, all_of(short_samples), all_of(long_samples))
+
+dim(ppindex_filtered)
+```
+
+Pre-processing steps: 
+
+```{r}
+# Boxplot before preprocessing
+boxplot(ppindex_filtered[, -1], las = 3, main = "ppIndex Data Distribution Before Preprocessing", cex.main = 2)  # to increase title text size
+
+# Filter out low counts
+keep_ppindex <- rowSums(ppindex_filtered[, -1] >= 10) >= 3
+ppindex_filtered <- ppindex_filtered[keep_ppindex,]
+
+# Log2 transformation
+log2_transformed <- ppindex_filtered
+log2_transformed[, -1] <- log2(ppindex_filtered[, -1] + 1)
+
+# Quantile normalization
+quantile_normalized <- log2_transformed
+quantile_normalized[, -1] <- normalize.quantiles(as.matrix(log2_transformed[, -1]))
+
+# Scaling (centering and scaling)
+scaled <- quantile_normalized
+scaled[, -1] <- scale(quantile_normalized[, -1], center = TRUE, scale = TRUE)
+
+# final preprocessed dataset
+ppindex_final <- scaled
+
+# Boxplot after preprocessing
+boxplot(ppindex_final[, -1], las = 3, main = "ppIndex Data Distribution After Preprocessing (Log2, Quantile Normalization, Scaling)", cex.main = 2)  
+
+```
+
+
+
+Differential exression analysis - limma:
+
+```{r}
+
+# Perform differential analysis
+df.limma.pp <- compare.by.limma(ppindex_final, long_samples, short_samples)
+
+
+# Filter significant results based on p-value
+significant_pp_results <- df.limma.pp[df.limma.pp$pvalues < p_value_threshold, ]
+
+#print the significant results
+print(significant_pp_results)
+
+
+# Order the significant results by absolute differential expression / most expressed but also pvalue <0.05 
+significant_pp_res <- significant_pp_results[order(abs(significant_pp_results$difference.long.vs.short), decreasing = TRUE), ]
+
+
+# View the top 10 most significant hits
+top_significant_pp <- head(significant_pp_res, 10)  
+#print top 10 
+print(top_significant_pp)
+
+
+```
+
+
+```{r}
+
+# volcano plot for the differential expression results
+
+ggplot(df.limma.pp, aes(x = difference.long.vs.short, y = -log10(pvalues))) +
+    geom_point(aes(color = pvalues < pval_threshold)) +
+    theme_minimal() +
+    labs(title = "Volcano Plot for PP-index Data", 
+         x = "Log2 Fold Change", 
+         y = "-log10(p-value)") +
+    geom_text_repel(data = top_significant_pp, #add in text the top 10 results 
+                    aes(label = X),
+                    size = 3, 
+                    max.overlaps = Inf) +  # Use Inf to avoid filtering out top 5
+    scale_color_manual(values = c("red", "blue"), name = "pvalues < 0.05") +
+    theme(legend.position = "right")
+```
+
+
+Pathway enrichment analysis:
+
+GO Enrichment 
+
+
+```{r}
+
+# Extract the symbols 
+significant_pp <- unique(sapply(strsplit(significant_pp_results$X, "\\("), `[`, 1))
+
+# Convert to Entrez IDs
+entrez_ids_pp <- bitr(significant_pp, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+##8.16% of input gene IDs are fail to map...
+
+
+# Perform GO enrichment analysis
+go_pp_enrichment <- enrichGO(gene = entrez_ids_pp$ENTREZID, 
+                          OrgDb = org.Hs.eg.db, 
+                          ont = "BP", # "BP" for Biological Processes
+                          pAdjustMethod = "BH", 
+                          pvalueCutoff = 0.05, 
+                          qvalueCutoff = 0.2, 
+                          readable = TRUE)
+
+
+# other categories (MF, CC)
+go_enrichment_pp_MF <- enrichGO(gene = entrez_ids_pp$ENTREZID, 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "MF", #"MF" for Molecular Functions
+                             pAdjustMethod = "BH", 
+                             pvalueCutoff = 0.05, 
+                             qvalueCutoff = 0.2, 
+                             readable = TRUE)
+
+go_enrichment_pp_CC <- enrichGO(gene = entrez_ids_pp$ENTREZID, 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "CC", #"CC" for Cellular Components
+                             pAdjustMethod = "BH", 
+                             pvalueCutoff = 0.05, 
+                             qvalueCutoff = 0.2, 
+                             readable = TRUE)
+
+
+
+```
+
+
+
+```{r}
+
+# Visualize for GO biological processes pathways 
+barplot(go_pp_enrichment, showCategory = 10, title = "GO Biological Processes Enrichment")
+dotplot(go_pp_enrichment, showCategory = 10, title = "GO Biological Processes Enrichment")
+
+# Use heatplot 
+heatplot(go_pp_enrichment, showCategory = 10)
+
+```
+
+```{r}
+#network plot
+cnetplot(go_pp_enrichment, showCategory = 4, title = "Gene-Concept Network for Biological Processes", 
+         max.overlaps = 100, node_label_size = 3, label_fontsize = 8) +
+  theme(axis.text.x = element_text(size = 10), 
+        axis.text.y = element_text(size = 10), 
+        plot.title = element_text(size = 14, face = "bold"))
+
+#decided on the number 4 for the categories, as more overwhelms the plot and data points were unlabeled 
+```
+
+
+```{r}
+# Visualize MF, CC
+
+#molecular functions 
+dotplot(go_enrichment_pp_MF, showCategory = 10, title = "GO Molecular Functions Enrichment")
+
+#cellular components 
+dotplot(go_enrichment_pp_CC, showCategory = 10, title = "GO Cellular Components Enrichment")
+
+```
+
+For specifically bad-responders/ targets associated with short survival group:
+
+```{r}
+
+#subset the data, keep only upregulated features in short survival group 
+subset_pp <- subset(significant_pp_results, difference.long.vs.short > 0)
+#clean the data - ready for GO pathway enrichment 
+clean_subset_pp <- unique(sapply(strsplit(subset_pp$X, "\\("), `[`, 1))
+
+# Convert these kinase names to Entrez IDs
+en_ids_pp <- bitr(clean_subset_pp, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+#GO pathway enrichment 
+go_pp_p_enrichment <- enrichGO(gene = en_ids_pp$ENTREZID, 
+                          OrgDb = org.Hs.eg.db, 
+                          ont = "BP", # "BP" for Biological Processes
+                          pAdjustMethod = "BH", 
+                          pvalueCutoff = 0.05, 
+                          qvalueCutoff = 0.2, 
+                          readable = TRUE)
+
+
+#Plots
+barplot(go_pp_p_enrichment, showCategory = 10, title = "GO Biological Processes enriched in short survival group")
+dotplot(go_pp_p_enrichment, showCategory = 10, title = "GO Biological Processes enriched in short survival group")
+heatplot(go_pp_p_enrichment, showCategory = 10)
+
+
+#network plot 
+cnetplot(go_pp_p_enrichment, showCategory = 4, title = "Gene-Concept Network for Biological Processes enriched in short survival group", 
+         max.overlaps = 100, node_label_size = 3, label_fontsize = 8) +
+  theme(axis.text.x = element_text(size = 10), 
+        axis.text.y = element_text(size = 10), 
+        plot.title = element_text(size = 14, face = "bold"))
+#decided on 4 to not overwhelm the network plot
+ 
+```
+
+
+Using gprofiler2 / using all significant differentially expressed features: 
+
+```{r}
+
+#gProfiler enrichment analysis
+gostres_pp <- gost(query = entrez_ids_pp$ENTREZID, 
+                organism = "hsapiens", 
+                sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC", "WP"), 
+                significant = TRUE, 
+                correction_method = "fdr",  
+                user_threshold = 0.05)
+
+# View results
+head(gostres_pp$result)
+
+# Plot results
+gostplot(gostres_pp, capped = TRUE, interactive = FALSE)
+```
+
+```{r}
+
+# Plot for each category (GO, KEGG, REACTOME, WIKIPATHWAYS)
+bp_plot_pp <- plot_results(gostres_pp$result, "GO:BP", "Top Biological Processes")
+mf_plot_pp <- plot_results(gostres_pp$result, "GO:MF", "Top Molecular Functions")
+cc_plot_pp <- plot_results(gostres_pp$result, "GO:CC", "Top Cellular Components")
+reac_plot_pp <- plot_results(gostres_pp$result, "REAC", "Top Reactome Pathways")
+kegg_plot_pp <- plot_results(gostres_pp$result, "KEGG", "Top KEGG Pathways")
+wp_plot_pp <- plot_results(gostres_pp$result, "WP", "Top WikiPathways")
+
+# Print plots
+print(bp_plot_pp)
+print(mf_plot_pp)
+print(cc_plot_pp)
+print(reac_plot_pp)
+print(kegg_plot_pp) #No KEGG pathways identified 
+print(wp_plot_pp) 
+
+```
+
+
+
+PROTEIN QUANTIFICATION
+
+
+```{r}
+# Filter protein quantification data
+prot_quant_filtered <- prot_quant_data %>%
+  dplyr::select(X, all_of(short_samples), all_of(long_samples))
+
+dim(prot_quant_filtered)
+
+```
+
+
+Pre-processing steps:
+
+```{r}
+
+# Boxplot before preprocessing
+boxplot(prot_quant_filtered[, -1], las = 3, main = "Protein quantification Data Distribution Before Preprocessing", cex.main = 2)
+
+# filtering out low counts
+keep_prot_quant <- rowSums(prot_quant_filtered[, -1] >= 10) >= 3
+prot_quant_filtered <- prot_quant_filtered[keep_prot_quant,]
+
+# Log2 transformation
+log2_transformed <- prot_quant_filtered
+log2_transformed[, -1] <- log2(prot_quant_filtered[, -1] + 1)
+
+# Quantile normalization
+quantile_normalized <- log2_transformed
+quantile_normalized[, -1] <- normalize.quantiles(as.matrix(log2_transformed[, -1]))
+
+# Scaling (centering and scaling)
+scaled <- quantile_normalized
+scaled[, -1] <- scale(quantile_normalized[, -1], center = TRUE, scale = TRUE)
+
+# Create the final preprocessed dataset
+prot_quant_final <- scaled
+
+# Boxplot after preprocessing
+boxplot(prot_quant_final[, -1], las = 3, main = "Protein quantification Data Distribution After Preprocessing (Log2, Quantile Normalization, Scaling)", cex.main = 2)
+
+
+```
+
+
+Differential expression analysis: 
+
+```{r}
+# Perform differential expression analysis
+df.limma.quant <- compare.by.limma(prot_quant_final, long_samples, short_samples)
+
+# Define the p-value threshold for significance
+p_value_threshold <- 0.05
+
+# Filter significant results based on p-value
+significant_pq_results <- df.limma.quant[df.limma.quant$pvalues < p_value_threshold, ]
+
+# Print significant results
+print(significant_pq_results)
+
+# Order the significant results by absolute differential expression / most expressed but also pvalue <0.05 
+significant_pq_res <- significant_pq_results[order(abs(significant_pq_results$difference.long.vs.short), decreasing = TRUE), ]
+
+# View the top 10 most significant hits
+top_significant_pq <- head(significant_pq_res, 10)  
+#Print top 10
+print(top_significant_pq)
+
+```
+
+
+```{r}
+
+#volcano plot for differential expression results 
+
+ggplot(df.limma.quant, aes(x = difference.long.vs.short, y = -log10(pvalues))) +
+    geom_point(aes(color = pvalues < pval_threshold)) +
+    theme_minimal() +
+    labs(title = "Volcano Plot for Protein Quantification Data", 
+         x = "Log2 Fold Change", 
+         y = "-log10(p-value)") +
+    geom_text_repel(data = top_significant_pq, #on text the top 10 results 
+                    aes(label = X),
+                    size = 3, 
+                    max.overlaps = Inf) +  # Use Inf to avoid filtering out top 5
+    scale_color_manual(values = c("red", "blue"), name = "pvalues < 0.05") +
+    theme(legend.position = "right")
+```
+
+
+Pathway enrichment analysis:
+
+GO Enrichment 
+
+
+```{r}
+
+# these are in the format of UniProt identifiers - so extract them to be used in the analysis 
+uniprot_ids <- significant_pq_results$X 
+
+# Extract gene symbols from phosphoprotein IDs - they are in the format GENE_HUMAN
+significant_pq <- unique(gsub("_HUMAN", "", uniprot_ids))
+
+# Convert gene symbols to Entrez IDs
+entrez_ids_pq <- bitr(significant_pq, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+#50.59% of input gene IDs are fail to map...
+#tried to use the bitr_kegg function to convert UniProt IDs to Entrez IDs: 100% failed to map
+
+
+# Perform GO enrichment analysis - used unadjusted for these to yield results
+
+go_pq_enrichment <- enrichGO(gene = entrez_ids_pq$ENTREZID, 
+                          OrgDb = org.Hs.eg.db, 
+                          ont = "BP", # "BP" for Biological Processes
+                          pAdjustMethod = "none", 
+                          pvalueCutoff = 0.01, 
+                          qvalueCutoff = 0.2, 
+                          readable = TRUE)
+
+
+# other categories (MF, CC)
+go_enrichment_pq_MF <- enrichGO(gene = entrez_ids_pq$ENTREZID, 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "MF", #molecular function
+                             pAdjustMethod = "BH", 
+                             pvalueCutoff = 0.05, 
+                             qvalueCutoff = 0.2, 
+                             readable = TRUE)
+
+
+go_enrichment_pq_CC <- enrichGO(gene = entrez_ids_pq$ENTREZID, 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "CC", #cellular components
+                             pAdjustMethod = "none", 
+                             pvalueCutoff = 0.01, 
+                             qvalueCutoff = 0.2, 
+                             readable = TRUE)
+
+
+
+```
+
+```{r}
+
+# Visualize for GO biological processes pathways 
+barplot(go_pq_enrichment, showCategory = 10, title = "GO Biological Processes Enrichment")
+dotplot(go_pq_enrichment, showCategory = 10, title = "GO Biological Processes Enrichment")
+
+# Use heatplot 
+heatplot(go_pq_enrichment, showCategory = 10)
+
+```
+
+```{r}
+#network plot
+cnetplot(go_pq_enrichment, showCategory = 4, title = "Gene-Concept Network for Biological Processes", 
+         max.overlaps = 100, node_label_size = 3, label_fontsize = 8) +
+  theme(axis.text.x = element_text(size = 10), 
+        axis.text.y = element_text(size = 10), 
+        plot.title = element_text(size = 14, face = "bold"))
+
+#decided on the number 4 for the categories, as higher number overwhelms the plot and data points were unlabeled 
+```
+
+```{r}
+# Visualize MF, CC
+
+dotplot(go_enrichment_pq_CC, showCategory = 10, title = "GO Cellular Components Enrichment")
+```
+
+For specifically bad-responders/ targets associated with short survival group:
+
+```{r}
+#subset the results, keeping only the features upregulared in the short survival group 
+subset_pq <- subset(significant_pq_results, difference.long.vs.short > 0)
+#clean the data - ready for the GO enrichment analysis 
+clean_subset_pq <- unique(gsub("_HUMAN", "", subset_pq$X))
+
+# Convert these kinase names to Entrez IDs
+en_ids_pq <- bitr(clean_subset_pq, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+#GO enrichment 
+go_pq_p_enrichment <- enrichGO(gene = en_ids_pq$ENTREZID, 
+                          OrgDb = org.Hs.eg.db, 
+                          ont = "BP", # "BP" for Biological Processes
+                          pAdjustMethod = "BH", 
+                          pvalueCutoff = 0.05, 
+                          qvalueCutoff = 0.2, 
+                          readable = TRUE)
+
+
+#Plots
+barplot(go_pq_p_enrichment, showCategory = 10, title = "GO Biological Processes enriched in short survival group")
+dotplot(go_pq_p_enrichment, showCategory = 10, title = "GO Biological Processes enriched in short survival group")
+heatplot(go_pq_p_enrichment, showCategory = 10)
+
+
+#network plot 
+cnetplot(go_pq_p_enrichment, showCategory = 5, title = "Gene-Concept Network for Biological Processes", 
+         max.overlaps = 100, node_label_size = 3, label_fontsize = 8) +
+  theme(axis.text.x = element_text(size = 10), 
+        axis.text.y = element_text(size = 10), 
+        plot.title = element_text(size = 14, face = "bold"))
+#decided on 5 to not overwhelm the plot 
+```
+
+
+Using gprofiler2 / used all the significant differentially expressed results: 
+
+```{r}
+#gost function
+gostres_pq <- gost(query = significant_pq, 
+                organism = "hsapiens", 
+                sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC", "WP"), 
+                significant = TRUE, 
+                correction_method = "fdr",  
+                user_threshold = 0.05)
+
+# View results
+head(gostres_pq$result)
+
+# Plot 
+gostplot(gostres_pq, capped = TRUE, interactive = FALSE)
+```
+
+```{r}
+
+# Plot for each category (GO, KEGG, REACTOME, WIKIPATHWAYS)
+bp_plot_pq <- plot_results(gostres_pq$result, "GO:BP", "Top Biological Processes")
+mf_plot_pq <- plot_results(gostres_pq$result, "GO:MF", "Top Molecular Functions")
+cc_plot_pq <- plot_results(gostres_pq$result, "GO:CC", "Top Cellular Components")
+reac_plot_pq <- plot_results(gostres_pq$result, "REAC", "Top Reactome Pathways")
+kegg_plot_pq <- plot_results(gostres_pq$result, "KEGG", "Top KEGG Pathways")
+wp_plot_pq <- plot_results(gostres_pq$result, "WP", "Top WikiPathways")
+
+# Print plots
+print(bp_plot_pq)
+print(mf_plot_pq)
+print(cc_plot_pq)
+print(reac_plot_pq) #No Reactome pathways identfied 
+print(kegg_plot_pq)  #No KEGG pathways identfied 
+print(wp_plot_pq)  #No WikiPathways pathways identfied 
+```
+
+
+
+KSEA data: 
+
+```{r}
+# Filter KSEA data
+KSEA_filtered <- ksea_data %>%
+  dplyr::select(X, all_of(short_samples), all_of(long_samples))
+
+dim(KSEA_filtered)
+```
+
+Pre-processing steps:
+
+need to first perform this step, as data contains missing(NA)/non-numeric values
+```{r}
+# Replace zeros and negative values to avoid issues with log2
+#a small constant was used to replace zeros and negative values 
+KSEA_filtered[, -1] <- apply(KSEA_filtered[, -1], 2, function(x) {
+  x[x <= 0] <- min(x[x > 0], na.rm = TRUE) / 10  # small constant to handle zeros or negative values
+  return(x)
+})
+```
+
+
+```{r}
+
+# Boxplot before preprocessing to check distribution
+boxplot(KSEA_filtered[, -1], las = 3, main = "KSEA Data Distribution Before Preprocessing", cex.main = 2)
+
+#filtered, but with a lower threshold 
+KSEA_filtered <- KSEA_filtered[rowSums(KSEA_filtered[, -1] > 1) >= 2, ]
+
+# Log2 transformation
+log2_transformed <- KSEA_filtered
+log2_transformed[, -1] <- log2(KSEA_filtered[, -1] + 1)
+
+# Quantile normalization
+quantile_normalized <- log2_transformed
+quantile_normalized[, -1] <- normalize.quantiles(as.matrix(log2_transformed[, -1]))
+
+# Scaling (centering and scaling)
+scaled <- quantile_normalized
+scaled[, -1] <- scale(as.matrix(quantile_normalized[, -1]), center = TRUE, scale = TRUE)
+
+# Create the final preprocessed dataset
+KSEA_final <- scaled
+
+# Boxplot after preprocessing
+boxplot(KSEA_final[, -1], las = 3, main = "KSEA Data Distribution After Preprocessing (Log2, Quantile Normalization, Scaling)", cex.main = 2)
+
+```
+
+Differential expression analysis:
+
+```{r}
+# Perform differential expression analysis
+df.limma.ksea <- compare.by.limma(KSEA_final, long_samples, short_samples)
+
+# Define the p-value threshold for significance
+p_value_threshold <- 0.05
+
+# Filter significant results based on p-value
+significant_ksea_results <- df.limma.ksea[df.limma.ksea$pvalues < p_value_threshold, ]
+
+# Print significant results
+print(significant_ksea_results)
+
+# Order the significant results by absolute differential expression / most expressed but also pvalue <0.05 
+significant_ksea_res <- significant_ksea_results[order(abs(significant_ksea_results$difference.long.vs.short), decreasing = TRUE), ]
+
+# View the top most significant hits
+top_significant_ksea <- head(significant_ksea_res, 10) 
+#print top 10
+print(top_significant_ksea)
+
+```
+
+
+```{r}
+#volcano plot of differential expression results 
+
+ggplot(df.limma.ksea, aes(x = difference.long.vs.short, y = -log10(pvalues))) +
+    geom_point(aes(color = pvalues < pval_threshold)) +
+    theme_minimal() +
+    labs(title = "Volcano Plot for KSEA Data", 
+         x = "Log2 Fold Change", 
+         y = "-log10(p-value)") +
+    geom_text_repel(data = top_significant_ksea, #top 10 results displayed in the plot 
+                    aes(label = X),
+                    size = 3, 
+                    max.overlaps = Inf) +  # Use Inf to avoid filtering out top 5
+    scale_color_manual(values = c("red", "blue"), name = "pvalues < 0.05") +
+    theme(legend.position = "right")
+```
+
+
+
+Pathway enrichent analysis: 
+
+GO Enrichment 
+
+
+```{r}
+# Have to create a list to insert to pathway enrichment analysis
+# Extract individual kinase names from the pairs
+individual_kinases <- unique(unlist(strsplit(significant_ksea_results$X, "\\.")))
+
+# Remove unwanted terms, mainly signor, or edges
+individual_kinases <- individual_kinases[!individual_kinases %in% c("signor", "edges")]
+
+# There is this "MAPK1_3" on the list, which is the MAPK1 and the MAPK3 
+individual_kinases <- c(individual_kinases, "MAPK1", "MAPK3")
+
+# Convert these kinase names to Entrez IDs
+kinase_entrez_ids_individual <- bitr(individual_kinases, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+#10% says was not mapped, but it was the "MAPK1_3", so everything else was mapped successfully
+
+```
+
+```{r}
+
+#perform GO enrichment 
+go_ksea_enrichment <- enrichGO(gene = kinase_entrez_ids_individual$ENTREZID, 
+                          OrgDb = org.Hs.eg.db, 
+                          ont = "BP", # "BP" for Biological Processes
+                          pAdjustMethod = "BH", 
+                          pvalueCutoff = 0.05, 
+                          qvalueCutoff = 0.2, 
+                          readable = TRUE)
+
+
+# other categories (MF, CC)
+go_enrichment_ksea_MF <- enrichGO(gene = kinase_entrez_ids_individual$ENTREZID, 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "MF", #molecular functions
+                             pAdjustMethod = "BH", 
+                             pvalueCutoff = 0.05, 
+                             qvalueCutoff = 0.2, 
+                             readable = TRUE)
+
+
+go_enrichment_ksea_CC <- enrichGO(gene = kinase_entrez_ids_individual$ENTREZID, 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "CC", #cellular components
+                             pAdjustMethod = "BH", 
+                             pvalueCutoff = 0.05, 
+                             qvalueCutoff = 0.2, 
+                             readable = TRUE)
+
+
+
+```
+
+```{r}
+
+# Visualize for GO biological processes pathways 
+barplot(go_ksea_enrichment, showCategory = 10, title = "GO Biological Processes Enrichment")
+dotplot(go_ksea_enrichment, showCategory = 10, title = "GO Biological Processes Enrichment")
+
+# Use heatplot 
+heatplot(go_ksea_enrichment, showCategory = 10)
+
+
+```
+
+```{r}
+#network plot 
+cnetplot(go_ksea_enrichment, showCategory = 5, title = "Gene-Concept Network for Biological Processes", 
+         max.overlaps = 100, node_label_size = 3, label_fontsize = 8) +
+  theme(axis.text.x = element_text(size = 10), 
+        axis.text.y = element_text(size = 10), 
+        plot.title = element_text(size = 14, face = "bold"))
+
+#decided on 5 to not overwhelm the plot 
+```
+
+```{r}
+# Visualize MF, CC
+
+dotplot(go_enrichment_ksea_MF, showCategory = 10, title = "GO Molecular Functions Enrichment")
+dotplot(go_enrichment_ksea_CC, showCategory = 10, title = "GO Cellular Components Enrichment")
+```
+
+
+For specifically bad-responders/ targets associated with short survival outcomes group:
+
+```{r}
+# Subset the data, keeping only the significant features upregulated in the short survival group 
+subset_ksea <- subset(significant_ksea_results, difference.long.vs.short > 0)
+# Clean the data, ready for anlalysis 
+subset_ksea <- unique(unlist(strsplit(subset_ksea$X, "\\.")))
+
+# Remove the unwanted terms
+subset_ksea <- subset_results4[!subset_ksea %in% c("signor", "edges")]
+
+#"MINK1" was not included so I added it 
+subset_ksea <- c(subset_ksea, "MINK1")
+
+# Convert these kinase names to Entrez IDs
+en_ids_ksea <- bitr(subset_ksea, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+#only "MAPK1_3" not mapped, but MAPK1 and MAPK3 mapped 
+
+#GO enrichment 
+go_ksea_p_enrichment <- enrichGO(gene = en_ids_ksea$ENTREZID, 
+                          OrgDb = org.Hs.eg.db, 
+                          ont = "BP", # "BP" for Biological Processes
+                          pAdjustMethod = "BH", 
+                          pvalueCutoff = 0.05, 
+                          qvalueCutoff = 0.2, 
+                          readable = TRUE)
+
+
+#Plots
+barplot(go_ksea_p_enrichment, showCategory = 10, title = "GO Biological Processes enriched in short survival group")
+dotplot(go_ksea_p_enrichment, showCategory = 10, title = "GO Biological Processes enriched in short survival group")
+heatplot(go_ksea_p_enrichment, showCategory = 10)
+
+
+#network plot 
+cnetplot(go_ksea_p_enrichment, showCategory = 5, title = "Gene-Concept Network for Biological Processes enriched in short survival group", 
+         max.overlaps = 100, node_label_size = 3, label_fontsize = 8) +
+  theme(axis.text.x = element_text(size = 10), 
+        axis.text.y = element_text(size = 10), 
+        plot.title = element_text(size = 14, face = "bold"))
+#decided on 5 to not overwhelm the plot 
+```
+
+
+
+Using gprofiler2 / using all significant differentially expressed results: 
+
+
+```{r}
+#Enrichment analysis 
+gostres_ksea <- gost(query = kinase_entrez_ids_individual$ENTREZID, 
+                organism = "hsapiens", 
+                sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC", "WP"), 
+                significant = TRUE, 
+                correction_method = "fdr",  
+                user_threshold = 0.05)
+
+#View results
+head(gostres_ksea$result)
+
+#Plot 
+gostplot(gostres_ksea, capped = TRUE, interactive = FALSE)
+```
+
+```{r}
+
+# Plot for each category (GO, KEGG, REACTOME, WIKIPATHWAYS)
+bp_plot_ksea <- plot_results(gostres_ksea$result, "GO:BP", "Top Biological Processes")
+mf_plot_ksea <- plot_results(gostres_ksea$result, "GO:MF", "Top Molecular Functions")
+cc_plot_ksea <- plot_results(gostres_ksea$result, "GO:CC", "Top Cellular Components")
+reac_plot_ksea <- plot_results(gostres_ksea$result, "REAC", "Top Reactome Pathways")
+kegg_plot_ksea <- plot_results(gostres_ksea$result, "KEGG", "Top KEGG Pathways")
+wp_plot_ksea <- plot_results(gostres_ksea$result, "WP", "Top WikiPathways")
+
+# Print plots
+print(bp_plot_ksea)
+print(mf_plot_ksea)
+print(cc_plot_ksea)
+print(reac_plot_ksea)
+print(kegg_plot_ksea)  
+print(wp_plot_ksea)  
+```
+
+
+RNA data:
+
+```{r}
+#Filter for samples that exist in the RNA dataset
+
+rna_short_samples <- intersect(short_samples, colnames(rna_data))
+rna_long_samples <- intersect(long_samples, colnames(rna_data))
+
+rna_filtered <- rna_data %>%
+  dplyr::select(X, all_of(rna_short_samples), all_of(rna_long_samples))
+
+dim(rna_filtered)
+
+```
+
+Pre-processing steps: 
+
+```{r}
+#convert data to DESeq2 format
+dds <- DESeqDataSetFromMatrix(countData = as.matrix(rna_filtered[, -1]), 
+                              colData = data.frame(condition = factor(c(rep("short", length(rna_short_samples)), 
+                                                                         rep("long", length(rna_long_samples))))), 
+                              design = ~ condition)
+
+
+#Assign rownames to dds object
+rownames(dds) <- rna_filtered$X
+
+#Filter out low count genes
+keep <- rowSums(counts(dds) >= 10) >= 3
+dds <- dds[keep,]
+
+# Run DESeq2 to normalize the data
+dds <- DESeq(dds)
+normalized_counts <- counts(dds, normalized = TRUE)
+
+#Log2 transform the normalized counts
+log2_normalized_counts <- log2(normalized_counts + 1)
+
+#Scale and centre
+scaled_counts <- scale(log2_normalized_counts, center = TRUE, scale = TRUE) 
+
+# Convert back to a data frame for easy/better handling
+scaled_counts_df <- as.data.frame(scaled_counts)
+
+# Update gene identifiers if they were in rownames
+rownames(scaled_counts_df) <- rownames(log2_normalized_counts)
+
+#new data frame - combined 
+rna_scaled_final <- data.frame(gene = rownames(scaled_counts_df), scaled_counts_df)
+
+
+
+```
+
+```{r}
+# Boxplot to visualize the data distribution (before and after)
+
+# Before
+boxplot(rna_filtered[, -1], las = 3, main = "RNA-seq Data Distribution before Preprocessing", cex.main = 2)
+
+#After
+boxplot(rna_scaled_final[, -1], las = 3, main = "RNA-seq Data Distribution after Preprocessing steps", cex.main = 2)
+
+
+```
+
+Differential expression analysis:
+
+```{r}
+
+# Perform differential analysis
+df.limma.rna <- compare.by.limma(rna_scaled_final, rna_long_samples, rna_short_samples)
+
+# Filter significant results based on p-value
+significant_rna_results <- df.limma.rna[df.limma.rna$pvalues < p_value_threshold, ]
+
+
+#View all significant results
+print(significant_rna_results)
+
+# Order the significant results by absolute differential expression / most expressed but also pvalue <0.05 
+significant_rna_res <- significant_rna_results[order(abs(significant_rna_results$difference.long.vs.short), decreasing = TRUE), ]
+
+# View the top 10 most significant hits
+top_significant_rna <- head(significant_rna_res, 20)  
+#Print top 10
+print(top_significant_rna)
+
+```
+
+
+```{r}
+# volcano plot for differential expression results 
+
+ggplot(df.limma.rna, aes(x = difference.long.vs.short, y = -log10(pvalues))) +
+    geom_point(aes(color = pvalues < pval_threshold)) +
+    theme_minimal() +
+    labs(title = "Volcano Plot for RNA Data", 
+         x = "Log2 Fold Change", 
+         y = "-log10(p-value)") +
+    geom_text_repel(data = top_significant_rna, #displayed are the top 20 instead of 10 this time, to also have a feature upregulated in the short survival side 
+                    aes(label = X),
+                    size = 3, 
+                    max.overlaps = Inf) +  # Use Inf to avoid filtering out top 5
+    scale_color_manual(values = c("red", "blue"), name = "pvalues < 0.05") +
+    theme(legend.position = "right")
+```
+
+PATHWAY ENRICHMENT ANALYSIS
+
+GO Enrichment:
+
+```{r}
+#Extract significant genes 
+gene_list_rna <- significant_rna_results$X
+
+#remove everything after the dot
+#the presence of additional suffixes or non-standard formats in the gene names, such as the use of dots (e.g., AC073072.1 or EAF1.AS1). These symbols might represent different isoforms, transcript variants, or other non-canonical identifiers that aren't directly recognized in the org.Hs.eg.db database for Entrez ID conversion. - so removed to keep a clean data for pathway enrichment 
+gene_list_rna_cleaned <- gsub("\\..*", "", gene_list_rna)
+
+#Convert gene symbols to Entrez IDs
+entrez_ids_rna <- bitr(gene_list_rna_cleaned, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+#6.57% of input gene IDs are fail to map...
+```
+
+```{r}
+#GO enrichment 
+
+#used unadjusted pvalue, but still no results
+go_RNA_enrichment <- enrichGO(gene = entrez_ids_rna$ENTREZID, 
+                          OrgDb = org.Hs.eg.db, 
+                          ont = "BP", # "BP" for Biological Processes
+                          pAdjustMethod = "none", 
+                          pvalueCutoff = 0.05, 
+                          qvalueCutoff = 0.2, 
+                          readable = TRUE)
+
+
+# other categories (MF, CC)
+
+#used unadjusted pvalue, but still no results
+go_enrichment_RNA_MF <- enrichGO(gene = entrez_ids_rna$ENTREZID, 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "MF", 
+                             pAdjustMethod = "none", 
+                             pvalueCutoff = 0.05, 
+                             qvalueCutoff = 0.2, 
+                             readable = TRUE)
+
+#results created 
+go_enrichment_RNA_CC <- enrichGO(gene = entrez_ids_rna$ENTREZID, 
+                             OrgDb = org.Hs.eg.db, 
+                             ont = "CC", 
+                             pAdjustMethod = "BH", 
+                             pvalueCutoff = 0.05, 
+                             qvalueCutoff = 0.2, 
+                             readable = TRUE)
+
+
+
+```
+
+
+
+```{r}
+# Visualize CC
+
+dotplot(go_enrichment_RNA_CC, showCategory = 10, title = "GO Cellular Components Enrichment")
+```
+
+
+For specifically bad-responders/ targets associated with short survival group:
+
+```{r}
+#Filter/subset data, keeping only features upregulated in the short survival group 
+subset_rna <- subset(significant_rna_results, difference.long.vs.short > 0)
+subset_rna <- subset_rna$X
+#clean - ready for analysis 
+subset_rna_cleaned <- gsub("\\..*", "", subset_rna)
+
+# Convert these kinase names to Entrez IDs
+en_ids_rna <- bitr(subset_rna_cleaned, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+#GO enrichment 
+go_rna_p_enrichment <- enrichGO(gene = en_ids_rna$ENTREZID, 
+                          OrgDb = org.Hs.eg.db, 
+                          ont = "BP", # "BP" for Biological Processes
+                          pAdjustMethod = "BH", 
+                          pvalueCutoff = 0.05, 
+                          qvalueCutoff = 0.2, 
+                          readable = TRUE)
+
+
+#Plots
+barplot(go_rna_p_enrichment, showCategory = 10, title = "GO Biological Processes enriched in short survival group")
+dotplot(go_rna_p_enrichment, showCategory = 10, title = "GO Biological Processes enriched in short survival group")
+heatplot(go_rna_p_enrichment, showCategory = 10)
+
+
+#network plot 
+cnetplot(go_rna_p_enrichment, showCategory = 5, title = "Gene-Concept Network for Biological Processes enriched in short survival group", 
+         max.overlaps = 100, node_label_size = 3, label_fontsize = 8) +
+  theme(axis.text.x = element_text(size = 10), 
+        axis.text.y = element_text(size = 10), 
+        plot.title = element_text(size = 14, face = "bold"))
+
+#decided on 5 to not overwhelm the plot 
+```
+
+
+
+Using gprofiler2 / for all significant differentially expressed features 
+
+
+```{r}
+
+gostres_RNA <- gost(query = entrez_ids_rna$ENTREZID, 
+                organism = "hsapiens", 
+                sources = c("GO:BP", "GO:MF", "GO:CC", "KEGG", "REAC", "WP"), 
+                significant = TRUE, 
+                correction_method = "fdr",  
+                user_threshold = 0.05)
+
+# View results
+head(gostres_RNA$result)
+
+# Plot 
+gostplot(gostres_RNA, capped = TRUE, interactive = FALSE)
+```
+
+
+```{r}
+
+# Plot for each category (GO, KEGG, REACTOME, WIKIPATHWAYS)
+bp_plot_RNA <- plot_results(gostres_RNA$result, "GO:BP", "Top Biological Processes")
+mf_plot_RNA <- plot_results(gostres_RNA$result, "GO:MF", "Top Molecular Functions")
+cc_plot_RNA <- plot_results(gostres_RNA$result, "GO:CC", "Top Cellular Components")
+reac_plot_RNA <- plot_results(gostres_RNA$result, "REAC", "Top Reactome Pathways")
+kegg_plot_RNA <- plot_results(gostres_RNA$result, "KEGG", "Top KEGG Pathways")
+wp_plot_RNA <- plot_results(gostres_RNA$result, "WP", "Top WikiPathways")
+
+# Print plots
+print(bp_plot_RNA)
+print(mf_plot_RNA)
+print(cc_plot_RNA)
+print(reac_plot_RNA) #No reactome
+print(kegg_plot_RNA)  #No KEGG
+print(wp_plot_RNA)  #No WikiPathways 
+```
+
+
+
+NOW FURTHER ANALYZE PATIENT INFORMATION 
+FIND SOME DESCRIPTIVE STATISTICS, PATIENT DEMOGRAPHIC INFORMATION: 
+
+```{r}
+
+#CHECK PATIENT INFO / KARYOTYPES 
+pt_short <- intersect(short_samples, pt_info$Sample_Name)
+pt_long <- intersect(long_samples, pt_info$Sample_Name)
+
+#Filter in each group for the information I am interested in which is: ample_Name, Type, Gender, Disease, Stage, Karyotype, Karyotype_group, age.at.diagnosis, STATUS, SURVIVAL..YRS.
+
+pt_info_short <- pt_info %>%
+  filter(Sample_Name %in% pt_short) %>%
+  dplyr::select(Sample_Name, Type, Gender, Disease, Stage, Karyotype, Karyotype_group, age.at.diagnosis, STATUS, SURVIVAL..YRS.)
+
+
+pt_info_long <- pt_info %>%
+  filter(Sample_Name %in% pt_long) %>%
+  dplyr::select(Sample_Name, Type, Gender, Disease, Stage, Karyotype, Karyotype_group, age.at.diagnosis, STATUS, SURVIVAL..YRS.)
+
+#Print to view 
+print(pt_info_short)
+print(pt_info_long)
+
+```
+
+In terms of patient demographics check the age and gender: 
+
+AGE AND GENDER 
+```{r}
+#Ensure all values are numeric / as there are some missing values in these datasets 
+pt_info_short$age.at.diagnosis <- as.numeric(as.character(pt_info_short$age.at.diagnosis))
+pt_info_long$age.at.diagnosis <- as.numeric(as.character(pt_info_long$age.at.diagnosis))
+
+#calculate mean age
+mean_age_short <- mean(pt_info_short$age.at.diagnosis, na.rm = TRUE) #na.rm as there are some missing values in these datasets 
+mean_age_long <- mean(pt_info_long$age.at.diagnosis, na.rm = TRUE)
+
+#Calculate gender overall number for the short survival group
+gender_count_short <- pt_info_short %>%
+  group_by(Gender) %>%
+  summarize(Count = n())
+
+#Calculate gender overall number for the long survival group
+gender_count_long <- pt_info_long %>%
+  group_by(Gender) %>%
+  summarize(Count = n())
+
+# Print results
+#short
+cat("Mean Age:", mean_age_short, "\n")
+print(gender_count_short)
+
+#long 
+cat("Mean Age:", mean_age_long, "\n")
+print(gender_count_long)
+
+
+```
+
+KARYOTYPE GROUP:
+These different types are found in these patients: "MLL", "Complex", "del17", "del5", "del7", "t(3;3)", "t(8;16)"
+```{r}
+# Calculate the count of each karyotype group - short survival group
+karyotype_count_short <- pt_info_short %>%
+  filter(Karyotype_group %in% c("MLL", "Complex", "del17", "del5", "del7", "t(3;3)", "t(8;16)")) %>%
+  group_by(Karyotype_group) %>%
+  summarize(Count = n())
+
+# the same for the long survival group
+karyotype_count_long <- pt_info_long %>%
+  filter(Karyotype_group %in% c("MLL", "Complex", "del17", "del5", "del7", "t(3;3)", "t(8;16)")) %>%
+  group_by(Karyotype_group) %>%
+  summarize(Count = n())
+
+# Print results
+#short
+print(karyotype_count_short)
+
+#long
+print(karyotype_count_long)
+
+```
+
+
+Some descriptive statistics regarding the patients' survival years - overall and the two groups: 
+
+
+```{r}
+#descriptive statistics for the whole dataset (all patients) - minimum value, max, median survival, and range 
+
+#calculate all 
+overall_survival_stats <- patients_list %>%
+  summarise(
+    mean_survival = mean(`SURVIVAL..YRS.`),
+    median_survival = median(`SURVIVAL..YRS.`),
+    min_survival = min(`SURVIVAL..YRS.`),
+    max_survival = max(`SURVIVAL..YRS.`),
+    range_survival = max(`SURVIVAL..YRS.`) - min(`SURVIVAL..YRS.`)
+  )
+
+
+# Print
+print(overall_survival_stats)
+
+```
+
+```{r}
+#descriptive statistics for the short survival group - minimum value, max, median survival, and range 
+
+#calculate all 
+short_survival_stats <- short_survivals %>%
+  summarise(
+    mean_survival = mean(`SURVIVAL..YRS.`),
+    median_survival = median(`SURVIVAL..YRS.`),
+    min_survival = min(`SURVIVAL..YRS.`),
+    max_survival = max(`SURVIVAL..YRS.`),
+     range_survival = max(`SURVIVAL..YRS.`) - min(`SURVIVAL..YRS.`)
+  )
+
+
+# Print
+print(short_survival_stats)
+
+```
+
+```{r}
+# descriptive statistics for the long survival group -minimum value, max, median survival, and range 
+
+#calculate all
+long_survival_stats <- long_survivals %>%
+  summarise(
+    mean_survival = mean(`SURVIVAL..YRS.`),
+    median_survival = median(`SURVIVAL..YRS.`),
+    min_survival = min(`SURVIVAL..YRS.`),
+    max_survival = max(`SURVIVAL..YRS.`),  
+    range_survival = max(`SURVIVAL..YRS.`) - min(`SURVIVAL..YRS.`)
+  )
+
+#print
+print(long_survival_stats)
+
+```
+
+Combine now all of them into a dataframe to create a graph to compare them, each statistic: minimum value, max, median survival, and range : 
+
+```{r}
+
+#combine all survival statistics into one dataframe
+combined_stats <- data.frame(
+  Group = c("Overall", "Short", "Long"),
+  Mean_Survival = c(overall_survival_stats$mean_survival, short_survival_stats$mean_survival, long_survival_stats$mean_survival),
+  Median_Survival = c(overall_survival_stats$median_survival, short_survival_stats$median_survival, long_survival_stats$median_survival),
+  Min_Survival = c(overall_survival_stats$min_survival, short_survival_stats$min_survival, long_survival_stats$min_survival),
+  Max_Survival = c(overall_survival_stats$max_survival, short_survival_stats$max_survival, long_survival_stats$max_survival),
+  Range_Survival = c(overall_survival_stats$range_survival, short_survival_stats$range_survival, long_survival_stats$range_survival)
+)
+
+#convert data to long format - helps with the plotting
+long_stats <- tidyr::pivot_longer(combined_stats, cols = -Group, names_to = "Statistic", values_to = "Value")
+
+#plot to view and compare all 
+
+ggplot(long_stats, aes(x = Group, y = Value, fill = Statistic)) +
+  geom_bar(stat = "identity", position = "dodge") +  # Ensure the + is at the end of this line
+  labs(title = "Comparison of Survival Statistics Across the Groups",
+       x = "Group",
+       y = "Survival (Years)",
+       fill = "Statistic") +
+  theme_minimal() +
+  scale_fill_brewer(palette = "Set3")
+
+
+```
+
+Now, some additional descriptive statistics for each dataset - based on the differential expression analysis results:
+- overall number of features 
+- overall number of features upregulated in the short survival group 
+- overall number of features upregulated in the long survival group
+
+```{r}
+# Total number of features in each dataset before filtering for significance (p-value <0.05)
+total_phosphoproteins <- nrow(df.limma.phospho)
+total_phosphorylation_sites <- nrow(df.limma.pp)
+total_proteins <- nrow(df.limma.quant)
+total_ksea <- nrow(df.limma.ksea)
+total_rna <- nrow(df.limma.rna)
+
+```
+
+
+```{r}
+# Number of significantly differentially expressed and statistically significant (p-value<0.05) features 
+num_sig_phosphoproteins <- nrow(significant_phospho_results)
+num_sig_phosphorylation_sites <- nrow(significant_pp_results)
+num_sig_proteins <- nrow(significant_pq_results)
+num_sig_ksea <- nrow(significant_ksea_results)
+num_sig_rna <- nrow(significant_rna_results)
+
+# Number of increased (above 0 - short survival upregulated) and decreased (below 0 - long survival upregulation) features
+num_increased_phosphoproteins <- sum(significant_phospho_results$difference.long.vs.short > 0)
+num_decreased_phosphoproteins <- sum(significant_phospho_results$difference.long.vs.short < 0)
+
+num_increased_phosphorylation_sites <- sum(significant_pp_results$difference.long.vs.short > 0)
+num_decreased_phosphorylation_sites <- sum(significant_pp_results$difference.long.vs.short < 0)
+
+num_increased_proteins <- sum(significant_pq_results$difference.long.vs.short > 0)
+num_decreased_proteins <- sum(significant_pq_results$difference.long.vs.short < 0)
+
+num_increased_ksea <- sum(significant_ksea_results$difference.long.vs.short > 0)
+num_decreased_ksea <- sum(significant_ksea_results$difference.long.vs.short < 0)
+
+num_increased_rna <- sum(significant_rna_results$difference.long.vs.short > 0)
+num_decreased_rna <- sum(significant_rna_results$difference.long.vs.short < 0)
+
+```
+
+
+Now add the increased and decreased from each dataset to create a plot to compare: 
+```{r}
+# have them all as a dataframe for the plot
+data_all <- data.frame(
+  Dataset = rep(c("Phosphoproteins", "pp-index", "Proteins", "KSEA", "RNA"), each = 2),
+  Expression = rep(c("Increased", "Decreased"), 5),
+  Count = c(
+    num_increased_phosphoproteins, num_decreased_phosphoproteins,
+    num_increased_phosphorylation_sites, num_decreased_phosphorylation_sites,
+    num_increased_proteins, num_decreased_proteins,
+    num_increased_ksea, num_decreased_ksea,
+    num_increased_rna, num_decreased_rna
+  )
+)
+
+```
+
+```{r}
+
+#create the plot 
+
+ggplot(data_all, aes(x = Dataset, y = Count, fill = Expression)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Number of increased and decreased significant features",
+       x = "Datasets",
+       y = "Number of Features") +
+  scale_fill_manual(values = c("Increased" = "skyblue", "Decreased" = "salmon")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_text(aes(label = Count), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.5, 
+            size = 3.5)  # Adjust the size as needed
+
+```
+
+Now, find the common targets (significant differentially expressed features) between datasets:
+
+```{r}
+#all significant results 
+phospho <- significant_ph
+ppIndex <- significant_pp
+proteinq <- significant_pq
+KSEA <- individual_kinases
+RNA <- gene_list_rna_cleaned
+
+```
+
+
+```{r}
+# Find common features between each 
+#phospho
+common_phospho_pp <- intersect(phospho, ppIndex)
+common_phospho_protein <- intersect(phospho, proteinq)
+common_phospho_KSEA <- intersect(phospho, KSEA)
+common_phospho_RNA <- intersect(phospho, RNA)
+#pp-index
+common_pp_protein <- intersect(ppIndex, proteinq)
+common_pp_KSEA <- intersect(ppIndex, KSEA)
+common_pp_RNA <- intersect(ppIndex, RNA)
+#protein quantification
+common_protein_KSEA <- intersect(proteinq, KSEA)
+common_protein_RNA <- intersect(proteinq, RNA)
+#last one- RNA
+common_KSEA_RNA <- intersect(KSEA, RNA)
+
+#To see if any element is common across all datasets
+common_all <- Reduce(intersect, list(phospho, ppIndex, proteinq, KSEA, RNA))
+
+```
+
+```{r}
+install.packages("VennDiagram")
+library(VennDiagram)
+```
+
+
+```{r}
+# Venn diagram created to better view the common results / - using the significant_results 
+venn.plot <- venn.diagram(
+  x = list(
+    Phosphoproteins = phospho,
+    "pp-index" = ppIndex,
+    Proteins = proteinq,
+    KSEA = KSEA,
+    RNA = RNA
+  ),
+  filename = NULL,  # Set to NULL to plot directly
+  fill = c("red", "blue", "green", "yellow", "purple"), #colors to better view the results 
+  alpha = 0.5,
+  cex = 1.5,
+  cat.cex = 1.5,
+  cat.pos = 0,
+  cat.dist = 0.05,
+  cat.default.pos = "outer",
+  rotation.degree = 0,
+  margin = 0.1,
+  lwd = 2,
+  lty = 'solid',
+  col = c("red", "blue", "green", "yellow", "purple"),
+  print.mode = c("raw"),
+  sigdigs = 2
+)
+
+#Plot the diagram 
+grid.newpage()
+grid.draw(venn.plot)
+
+```
+
+
+NOW, DRUG SENSITIVITY SCORES USING THE DRUG SENSITIVITY TABLE: 
+
+
+```{r}
+
+#filter for only the short and long survival groups 
+DRUG_short_samples <- intersect(short_samples, colnames(Table_of_sDSS))
+DRUG_long_samples <- intersect(long_samples, colnames(Table_of_sDSS))
+
+table_of_sDSS_filtered_short <- Table_of_sDSS %>%
+  dplyr::select(drug, functional.class, mechanism.target, development.phase, all_of(DRUG_short_samples))
+
+table_of_sDSS_filtered_long <- Table_of_sDSS %>%
+  dplyr::select(drug, functional.class, mechanism.target, development.phase, all_of(DRUG_long_samples))
+
+
+```
+
+For all of these take into account that there were missing values in some, so function created to have everything numeric and remove such unwanted values
+
+First, for CDKN1B: 
+```{r}
+
+#For CDKN1B 
+
+# Filter for drugs targeting 'CDK' (for CDK inhibitors)
+short_CDK <- table_of_sDSS_filtered_short %>% filter(grepl("CDK", mechanism.target, ignore.case = TRUE))
+
+long_CDK <- table_of_sDSS_filtered_long %>% filter(grepl("CDK", mechanism.target, ignore.case = TRUE))
+
+#Function used to clean and convert columns to numeric
+convert_columns_to_numeric <- function(df) {
+  df %>%
+    mutate(across(starts_with("T"), function(x) {
+      as.numeric(gsub("[^0-9.]", "", as.character(x)))  # Remove non-numeric characters before conversion
+    }, .names = "numeric_{col}"))
+}
+
+#apply the function to each group
+short_CDK <- short_CDK %>% convert_columns_to_numeric()
+long_CDK <- long_CDK %>% convert_columns_to_numeric()
+
+# Calculate mean sensitivity score for each drug - excluding NAs/missing values 
+short_CDK <- short_CDK %>%
+  rowwise() %>%
+  mutate(mean_sensitivity = mean(c_across(starts_with("numeric_")), na.rm = TRUE))
+
+long_CDK <- long_CDK %>%
+  rowwise() %>%
+  mutate(mean_sensitivity = mean(c_across(starts_with("numeric_")), na.rm = TRUE))
+
+#then calculate overall means
+mean_sensitivity_short <- mean(short_CDK$mean_sensitivity, na.rm = TRUE)
+mean_sensitivity_long <- mean(long_CDK$mean_sensitivity, na.rm = TRUE)
+
+#Print overall mean sensitivity score
+print("Mean Sensitivity Scores:")
+print(paste("Short Survival Group: ", mean_sensitivity_short))
+print(paste("Long Survival Group: ", mean_sensitivity_long))
+
+```
+
+
+For ACSS2: 
+
+```{r}
+
+#FOR ACSS2 
+
+#The function to clean and convert columns to numeric
+convert_columns_to_numeric <- function(df) {
+  df %>%
+    mutate(across(starts_with("T"), ~as.numeric(as.character(.))))
+}
+
+#filter for the drugs interacting with ACSS2 identified in DGIb
+ACSS2_short <- table_of_sDSS_filtered_short %>%
+  filter(drug %in% c("Docetaxel", "Gemcitabine")) %>%
+  convert_columns_to_numeric()
+
+ACSS2_long <- table_of_sDSS_filtered_long %>%
+  filter(drug %in% c("Docetaxel", "Gemcitabine")) %>%
+  convert_columns_to_numeric()
+
+# Calculate mean sensitivity score for each drug - excluding the NAs
+ACSS2_short <- ACSS2_short %>%
+  rowwise() %>%
+  mutate(mean_sensitivity = mean(c_across(starts_with("T")), na.rm = TRUE))
+
+ACSS2_long <- ACSS2_long %>%
+  rowwise() %>%
+  mutate(mean_sensitivity = mean(c_across(starts_with("T")), na.rm = TRUE))
+
+# Calculate overall means
+mean_ACSS2_short <- mean(ACSS2_short$mean_sensitivity, na.rm = TRUE)
+mean_ACSS2_long <- mean(ACSS2_long$mean_sensitivity, na.rm = TRUE)
+
+# Print overall mean sensitivity scores
+print("Mean Sensitivity Scores:")
+print(paste("Short Survival Group: ", mean_ACSS2_short))
+print(paste("Long Survival Group: ", mean_ACSS2_long))
+
+```
+
+For CTNNB1: 
+
+```{r}
+#FOR CTNNB1 
+
+#Filter for the drugs interacting with CTNNB1 identified in DGIb
+CTNNB1_short <- table_of_sDSS_filtered_short %>%
+  filter(drug %in% c("Letrozole", "Imatinib", "Triciribine", "Sorafenib", "Temsirolimus", "Lenalidomide", "Thalidomide", "AZ 3146")) %>%
+  convert_columns_to_numeric()
+
+CTNNB1_long <- table_of_sDSS_filtered_long %>%
+  filter(drug %in% c("Letrozole", "Imatinib", "Triciribine", "Sorafenib", "Temsirolimus", "Lenalidomide", "Thalidomide", "AZ 3146")) %>%
+  convert_columns_to_numeric()
+
+#Calculate mean sensitivity score for each drug - excluding NAs
+CTNNB1_short <- CTNNB1_short %>%
+  rowwise() %>%
+  mutate(mean_sensitivity = mean(c_across(starts_with("T")), na.rm = TRUE))
+
+CTNNB1_long <- CTNNB1_long %>%
+  rowwise() %>%
+  mutate(mean_sensitivity = mean(c_across(starts_with("T")), na.rm = TRUE))
+
+#Calculate overall means
+mean_CTNNB1_short <- mean(CTNNB1_short$mean_sensitivity, na.rm = TRUE)
+mean_CTNNB1_long <- mean(CTNNB1_long$mean_sensitivity, na.rm = TRUE)
+
+# Print 
+print("Mean Sensitivity Scores:")
+print(paste("Short Survival Group: ", mean_CTNNB1_short))
+print(paste("Long Survival Group: ", mean_CTNNB1_long))
+
+```
+
+For MAP4K5 - MINK1:
+
+```{r}
+#FOR MAP4K5.MINK1.edges 
+
+#Filter for the drugs interacting with MAP4K5 and MINK1 identified in DGIb
+MM_short <- table_of_sDSS_filtered_short %>%
+  filter(drug %in% c("Vandetanib", "Gefitinib", "Dasatinib anhydrous", "Cediranib", "Dovitinib", "Tozasertib", "Linifanib", "Sorafenib", "Erlotinib", "SNS-314")) %>%
+  convert_columns_to_numeric()
+
+MM_long <- table_of_sDSS_filtered_long %>%
+  filter(drug %in% c("Vandetanib", "Gefitinib", "Dasatinib anhydrous", "Cediranib", "Dovitinib", "Tozasertib", "Linifanib", "Sorafenib", "Erlotinib", "SNS-314")) %>%
+  convert_columns_to_numeric()
+
+
+#calculate mean sensitivity score for each drug - excluding NAs
+MM_short <- MM_short %>%
+  rowwise() %>%
+  mutate(mean_sensitivity = mean(c_across(starts_with("T")), na.rm = TRUE))
+
+MM_long <- MM_long %>%
+  rowwise() %>%
+  mutate(mean_sensitivity = mean(c_across(starts_with("T")), na.rm = TRUE))
+
+#Calculate overall means
+mean_MM_short <- mean(MM_short$mean_sensitivity, na.rm = TRUE)
+mean_MM_long <- mean(MM_long$mean_sensitivity, na.rm = TRUE)
+
+#Print results
+print("Mean Sensitivity Scores:")
+print(paste("Short Survival Group: ", mean_MM_short))
+print(paste("Long Survival Group: ", mean_MM_long))
+
+```
+For PRKD1: 
+
+
+```{r}
+#FOR PRKD1
+
+#Filter for the drugs interacting with PRKD1 identified in DGIb
+PRKD1_short <- table_of_sDSS_filtered_short %>%
+  filter(drug %in% c("Midostaurin", "Bryostatin")) %>%
+  convert_columns_to_numeric()
+
+PRKD1_long <- table_of_sDSS_filtered_long %>%
+  filter(drug %in% c("Midostaurin", "Bryostatin")) %>%
+  convert_columns_to_numeric()
+
+
+#Calculate mean sensitivity score for each drug - excluding the NAs
+PRKD1_short <- PRKD1_short %>%
+  rowwise() %>%
+  mutate(mean_sensitivity = mean(c_across(starts_with("T")), na.rm = TRUE))
+
+PRKD1_long <- PRKD1_long %>%
+  rowwise() %>%
+  mutate(mean_sensitivity = mean(c_across(starts_with("T")), na.rm = TRUE))
+
+#Calculate overall means
+mean_PRKD1_short <- mean(PRKD1_short$mean_sensitivity, na.rm = TRUE)
+mean_PRKD1_long <- mean(PRKD1_long$mean_sensitivity, na.rm = TRUE)
+
+#Print overall means
+print("Mean Sensitivity Scores:")
+print(paste("Short Survival Group: ", mean_PRKD1_short))
+print(paste("Long Survival Group: ", mean_PRKD1_long))
+
+```
+
+To create a plot for the Results section showing all the mean drug sensitivity score of these drugs:
+
+```{r}
+#create dataframe - add all
+data <- data.frame(
+  Feature = c("CDKN1B", "ACSS2", "CTNNB1", "MAP4K5/MINK1", "PRKD1"),
+  Short_Survival_Group = c(mean_sensitivity_short, mean_ACSS2_short, mean_CTNNB1_short, mean_MM_short, mean_PRKD1_short),
+  Long_Survival_Group = c(mean_sensitivity_long, mean_ACSS2_long, mean_CTNNB1_long, mean_MM_long, mean_PRKD1_long)
+)
+
+#have the data to long format for ggplot2
+library(reshape2)
+data_melted <- melt(data, id.vars = "Feature", variable.name = "Group", value.name = "Mean_Sensitivity")
+
+```
+
+```{r}
+# The plot for drug sensitivity 
+
+ggplot(data_melted, aes(x = Feature, y = Mean_Sensitivity, fill = Group)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  geom_text(aes(label = round(Mean_Sensitivity, 2)), 
+            position = position_dodge(width = 0.9), 
+            vjust = -0.3, 
+            size = 3.5) +
+  theme_minimal() +
+  labs(title = "Mean Drug Sensitivity Scores by Feature",
+       x = "Feature",
+       y = "Mean Sensitivity Score",
+       fill = "Group") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
